@@ -2,7 +2,7 @@ import numpy as np
 import pandas as pd
 from sklearn.linear_model import LogisticRegression
 
-def identf_split(X_train, y_train):
+def identf_split(X_train, y_train, c_threshold=0.6):
 
     clf = LogisticRegression()
     clf.fit(X_train, y_train)
@@ -13,8 +13,7 @@ def identf_split(X_train, y_train):
     confidences = confidences.max(axis=1)
     confidences = pd.DataFrame(confidences, columns=['confidnece_score'])
     confidences['index'] = list(range(0,len(confidences)))
-    
-    c_threshold = 0.6
+
     confidences['identification'] = np.where(
         confidences['confidnece_score'] >= c_threshold, True, False)
 

@@ -9,9 +9,9 @@ import torch.optim as optim
 from torch.utils.data import DataLoader, TensorDataset
 import numpy as np
 from typing import Tuple, Optional, Dict, Any
-from identification import identf_split
+from simple_mlp.identification import identf_split
 import os
-from model import NoiseGenerator
+from simple_mlp.noisemodel import NoiseGenerator
 from torch.autograd import Variable
 from collections import OrderedDict
 import pandas as pd
@@ -23,7 +23,7 @@ from torch.utils.data import Dataset
 from sklearn.metrics import accuracy_score, f1_score, confusion_matrix
 from tabulate import tabulate
 
-class MLPTrainer:
+class Trainer:
     """
     A simple two-layer MLP trainer.
 
@@ -40,21 +40,35 @@ class MLPTrainer:
         epoches: int = 100,
         device: str = 'cpu',
         verbose: bool = True,
-        model_path: str = 'temp_models',
+        model_path: str = './temp_models',
         signiture: str = 'test',
-        run_id: int = 1
+        run_id: int = 1,
+        seed: int = 7,
+        c_threshold: float = 0.6,
+        ema_momentum: float = 0.999,
+        pseudo_epochs: int = 3,
+        predict_threshold: float = 0.5
     ):
         """
         Initialize the trainer.
 
         Args:
-            model: externally defined PyTorch model
+            high_generator: externally defined high-confidence PyTorch model
+            low_generator: externally defined low-confidence PyTorch model
+            noise_model: learnable noise generator
             learning_rate: learning rate
             batch_size: batch size
             epoches: number of training epochs
             device: device ('cpu' or 'cuda')
             verbose: whether to print training logs
             model_path: path to save models
+            signiture: tag added to saved model file names
+            run_id: unique run id added to saved model file names
+            seed: random seed for the train/valid/test splits
+            c_threshold: confidence threshold for the high/low identification split
+            ema_momentum: EMA weight for the high generator during refinement
+            pseudo_epochs: number of pseudo-learning epochs for the low generator
+            predict_threshold: probability threshold for binary classification
         """
         self.high_generator = high_generator
         self.low_generator = low_generator
@@ -67,6 +81,11 @@ class MLPTrainer:
         self.model_path = model_path
         self.signiture = signiture
         self.run_id = run_id
+        self.seed = seed
+        self.c_threshold = c_threshold
+        self.ema_momentum = ema_momentum
+        self.pseudo_epochs = pseudo_epochs
+        self.predict_threshold = predict_threshold
 
         # Move models to the specified device
         self.high_generator.to(self.device)
@@ -126,9 +145,10 @@ class MLPTrainer:
         print("Equal Odds %.4f" %(eodds))
         print("Demographic Parity %.4f"%(sp))
 
-    def load_data(self, csv_name, sensitive, predict_attr, intertsted_columns,
+    @staticmethod
+    def load_data(csv_name, sensitive, predict_attr, intertsted_columns,
                   categorical_features = None, sensitive_mapping=None,
-                  use_FeatureHasher = False, query_str = None):
+                  use_FeatureHasher = False, query_str = None, n_features = 20):
         df = pd.read_csv("./data/{}.csv".format(csv_name))
         if query_str is not None:
             df = df.query(query_str)
@@ -140,11 +160,16 @@ class MLPTrainer:
         groundtruths = df[predict_attr].values
 
         if use_FeatureHasher and categorical_features is not None:
-            # Use FeatureHasher to encode categorical features
-            categorical_features = X[categorical_features].apply(lambda x: x.astype(str).tolist(), axis=1)
-            hasher = FeatureHasher(n_features=20, input_type='string')
-            hashed_features = hasher.transform(categorical_features)
-            header =  [x for x in header if x not in categorical_features]
+            # Hash the (high-cardinality) categorical columns into a small dense
+            # block. Keep the original column-name list separate so we can drop
+            # the hashed columns afterwards (otherwise get_dummies below would
+            # one-hot encode them a second time).
+            cat_strings = X[categorical_features].apply(lambda x: x.astype(str).tolist(), axis=1)
+            hasher = FeatureHasher(n_features=n_features, input_type='string')
+            hashed_features = hasher.transform(cat_strings)
+            # Drop the original hashed columns; any remaining (low-cardinality)
+            # categorical columns are still one-hot encoded by get_dummies below.
+            header = [x for x in header if x not in categorical_features]
             X = X[header]
             for i in range(hashed_features.shape[1]):
                 X[f'hashed_feature_{i+1}'] = hashed_features.toarray()[:, i]
@@ -166,7 +191,8 @@ class MLPTrainer:
 
         return X, groundtruths
 
-    def load_train_test_valid(self,X, y, f, train_ratio, valid_ratio):
+    @staticmethod
+    def load_train_test_valid(X, y, f, train_ratio, valid_ratio, seed=7):
         class A_C(Dataset):
             def __init__(self, attrs, labels):
                 self.attrs = attrs
@@ -183,15 +209,15 @@ class MLPTrainer:
         rest_data = data_size * (1 - true_test_ratio)
         true_valid_ratio = (rest_data - data_size * train_ratio) / rest_data
 
-        train, valid, train_labels, valid_labels = train_test_split(X, y, test_size=true_valid_ratio, random_state=7)
+        train, valid, train_labels, valid_labels = train_test_split(X, y, test_size=true_valid_ratio, random_state=seed)
         if f != 'highConf' and f != 'lowConf':
             header = list(X.columns)
             header = header[:-1]
             ct = ColumnTransformer([('_', StandardScaler(), header)], remainder='passthrough')
             X = ct.fit_transform(X)
             print('after scaling: ', X.shape)
-            train, test, train_labels, test_labels = train_test_split(X, y, test_size=true_test_ratio, random_state=7)
-            train, valid, train_labels, valid_labels = train_test_split(train, train_labels, test_size=true_valid_ratio, random_state=7)
+            train, test, train_labels, test_labels = train_test_split(X, y, test_size=true_test_ratio, random_state=seed)
+            train, valid, train_labels, valid_labels = train_test_split(train, train_labels, test_size=true_valid_ratio, random_state=seed)
 
         train_set = A_C(train, train_labels)
         print("len of train labels: ", train_set.__len__())
@@ -221,7 +247,7 @@ class MLPTrainer:
         """
         Identification
         """
-        return identf_split(X_train, y_train)
+        return identf_split(X_train, y_train, self.c_threshold)
 
     def cold_start(
         self,
@@ -348,7 +374,7 @@ class MLPTrainer:
         }
 
     def psudo_learning(self, low_generator_path, psudo_predicted, batch_input):
-        epochs = 3
+        epochs = self.pseudo_epochs
         low_model = torch.load(low_generator_path)
 
         model_path = os.path.join(
@@ -432,7 +458,7 @@ class MLPTrainer:
             for key, value in model.state_dict().items():
                 if key in lowConf_dict.keys():
                     new_highConf_dict[key] = (
-                        lowConf_dict[key] * (1 - 0.999) + value * 0.999
+                        lowConf_dict[key] * (1 - self.ema_momentum) + value * self.ema_momentum
                     )
             model.load_state_dict(new_highConf_dict)
             new_predicted = model(batch_X[:, :-1])
@@ -493,7 +519,7 @@ class MLPTrainer:
 
                 outputs = best_model(new_batch_input)
                 sensitives_list.append(batch_X[:, -1])
-                predictions = (outputs > 0.5).float().cpu().numpy()
+                predictions = (outputs > self.predict_threshold).float().cpu().numpy()
                 output_test_list.append(predictions)
 
         # Convert lists into numpy arrays and flatten
