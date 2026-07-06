@@ -10,6 +10,7 @@ from torch.utils.data import DataLoader, TensorDataset
 import numpy as np
 from typing import Tuple, Optional, Dict, Any
 from simple_mlp.identification import identf_split
+from simple_mlp import preprocess
 import os
 from simple_mlp.noisemodel import NoiseGenerator
 from torch.autograd import Variable
@@ -112,13 +113,17 @@ class Trainer:
         g1 = privileged_group
         g0 = privileged_group^1
 
+        # Only rows with a known sensitive attribute (0/1) take part in the
+        # fairness analysis; unknown rows (sentinel -1) are excluded.
+        df_pred = df_pred[df_pred[label].isin([g0, g1])]
+
         # Privileged group
         df_priv = df_pred[df_pred[label]==g1]
         priv_truth = df_priv['true_labels']
         priv_pred = df_priv['predicted_labels']
 
         pr1=len([i for i in priv_pred if i==1])/len(priv_pred)
-        cm = confusion_matrix(priv_truth,priv_pred)
+        cm = confusion_matrix(priv_truth,priv_pred,labels=[0,1])
         tn1, fp1, fn1, tp1=cm.ravel()
         g1_results = [ f1_score(priv_truth,priv_pred,average='weighted'), tp1/(tp1+fn1), fp1/(fp1+tn1), pr1]
         print("this is pr1: ", pr1)
@@ -129,7 +134,7 @@ class Trainer:
         nopriv_pred = df_nopriv['predicted_labels']
 
         pr0=len([i for i in nopriv_pred if i==1])/len(nopriv_pred)
-        cm = confusion_matrix(nopriv_truth,nopriv_pred)
+        cm = confusion_matrix(nopriv_truth,nopriv_pred,labels=[0,1])
         tn0, fp0, fn0, tp0 = cm.ravel()
         g0_results = [f1_score(nopriv_truth,nopriv_pred,average='weighted'), tp0/(tp0+fn0), fp0/(fp0+tn0), pr0]
         print("this is pr0: ", pr0)
@@ -146,53 +151,81 @@ class Trainer:
         print("Demographic Parity %.4f"%(sp))
 
     @staticmethod
-    def load_data(csv_name, sensitive, predict_attr, intertsted_columns,
-                  categorical_features = None, sensitive_mapping=None,
-                  use_FeatureHasher = False, query_str = None, n_features = 20):
+    def load_data(csv_name, predict_attr,
+                  numeric_columns=None, categorical_columns=None,
+                  multihot_columns=None, hash_columns=None, hash_n_features=None,
+                  sensitive_exclude_columns=None, sensitive_label_column=None,
+                  race_list=None, privileged_race=None,
+                  multivalue_separator=';', match_method='fuzzy',
+                  match_threshold=0.6, query_str=None):
+        """
+        Load and preprocess a dataset according to the per-column configuration.
+
+        Returns:
+            X    : feature DataFrame; the LAST column is 'sensitive_info'
+                   (1 = privileged, 0 = non-privileged, -1 = unknown).
+            y    : label array.
+            meta : dict with 'numeric_columns' (names needing standardisation).
+        """
         df = pd.read_csv("./data/{}.csv".format(csv_name))
         if query_str is not None:
             df = df.query(query_str)
+        df = df.reset_index(drop=True)
 
-        header = list(intertsted_columns)
-        header.remove(predict_attr)
+        # Drop rows without a label -- they cannot be used for training.
+        n_before = len(df)
+        df = df[df[predict_attr].notna()].reset_index(drop=True)
+        dropped = n_before - len(df)
+        if dropped > 0:
+            print("Dropped {} rows with a missing '{}' label.".format(dropped, predict_attr))
 
-        X = df[header]
-        groundtruths = df[predict_attr].values
+        # Guard: sensitive columns must never appear among the feature columns.
+        sensitive_exclude_columns = list(sensitive_exclude_columns or [])
+        feature_cols = (list(numeric_columns or []) + list(categorical_columns or [])
+                        + list(multihot_columns or []) + list(hash_columns or []))
+        leaked = [c for c in feature_cols if c in sensitive_exclude_columns]
+        if leaked:
+            raise ValueError(
+                "Sensitive columns {} must not be used as features.".format(leaked))
 
-        if use_FeatureHasher and categorical_features is not None:
-            # Hash the (high-cardinality) categorical columns into a small dense
-            # block. Keep the original column-name list separate so we can drop
-            # the hashed columns afterwards (otherwise get_dummies below would
-            # one-hot encode them a second time).
-            cat_strings = X[categorical_features].apply(lambda x: x.astype(str).tolist(), axis=1)
-            hasher = FeatureHasher(n_features=n_features, input_type='string')
-            hashed_features = hasher.transform(cat_strings)
-            # Drop the original hashed columns; any remaining (low-cardinality)
-            # categorical columns are still one-hot encoded by get_dummies below.
-            header = [x for x in header if x not in categorical_features]
-            X = X[header]
-            for i in range(hashed_features.shape[1]):
-                X[f'hashed_feature_{i+1}'] = hashed_features.toarray()[:, i]
+        y = df[predict_attr].astype(float).values
 
-        X = pd.get_dummies(X)
-        X.reset_index(drop=True, inplace=True)
+        # Build the feature matrix from the per-type column lists.
+        X, numeric_out = preprocess.process_features(
+            df,
+            numeric_columns=numeric_columns,
+            categorical_columns=categorical_columns,
+            multihot_columns=multihot_columns,
+            hash_columns=hash_columns,
+            hash_n_features=hash_n_features,
+            sep=multivalue_separator,
+        )
         X = X.sort_index(axis=1)
 
-        if sensitive_mapping is not None:
-            def f(row):
-                for col, val in sensitive_mapping.items():
-                    if row[col] == 1:
-                        return val
-                return None  # fallback
+        # Derive the fairness group label (privileged / non-privileged / unknown).
+        if sensitive_label_column is not None:
+            sensitive_info = preprocess.build_sensitive_info(
+                df[sensitive_label_column], race_list, privileged_race,
+                sep=multivalue_separator, method=match_method,
+                threshold=match_threshold)
+        else:
+            sensitive_info = np.full(len(df), preprocess.UNKNOWN_SENSITIVE)
+        X['sensitive_info'] = sensitive_info
 
-            X['sensitive_info'] = X.apply(f, axis=1)
+        # Ensure 'sensitive_info' is the LAST column (model uses X[:, :-1]).
+        ordered = [c for c in X.columns if c != 'sensitive_info'] + ['sensitive_info']
+        X = X[ordered].astype(float)
 
-        X = X[X.columns.drop(list(X.filter(regex = sensitive)))]
+        n_priv = int((sensitive_info == 1).sum())
+        n_nonpriv = int((sensitive_info == 0).sum())
+        n_unknown = int((sensitive_info == preprocess.UNKNOWN_SENSITIVE).sum())
+        print("Sensitive groups -> privileged: {}, non-privileged: {}, unknown: {}".format(
+            n_priv, n_nonpriv, n_unknown))
 
-        return X, groundtruths
+        return X, y, {'numeric_columns': numeric_out}
 
     @staticmethod
-    def load_train_test_valid(X, y, f, train_ratio, valid_ratio, seed=7):
+    def load_train_test_valid(X, y, f, train_ratio, valid_ratio, seed=7, numeric_columns=None):
         class A_C(Dataset):
             def __init__(self, attrs, labels):
                 self.attrs = attrs
@@ -211,13 +244,25 @@ class Trainer:
 
         train, valid, train_labels, valid_labels = train_test_split(X, y, test_size=true_valid_ratio, random_state=seed)
         if f != 'highConf' and f != 'lowConf':
-            header = list(X.columns)
-            header = header[:-1]
-            ct = ColumnTransformer([('_', StandardScaler(), header)], remainder='passthrough')
-            X = ct.fit_transform(X)
-            print('after scaling: ', X.shape)
+            # Split BEFORE scaling so the scaler only sees the training data.
+            # Fitting StandardScaler on the full X would leak the mean/variance
+            # of the validation and test splits into training (data leakage).
             train, test, train_labels, test_labels = train_test_split(X, y, test_size=true_test_ratio, random_state=seed)
             train, valid, train_labels, valid_labels = train_test_split(train, train_labels, test_size=true_valid_ratio, random_state=seed)
+            # Standardise ONLY the numeric columns (categorical / multi-hot /
+            # hashed / sensitive columns are left as-is). Fit on the training
+            # split, then apply the same transform to validation and test.
+            if numeric_columns:
+                ct = ColumnTransformer([('num', StandardScaler(), list(numeric_columns))],
+                                       remainder='passthrough')
+                train = ct.fit_transform(train)
+                valid = ct.transform(valid)
+                test = ct.transform(test)
+            else:
+                train = np.asarray(train, dtype=float)
+                valid = np.asarray(valid, dtype=float)
+                test = np.asarray(test, dtype=float)
+            print('after scaling: ', train.shape)
 
         train_set = A_C(train, train_labels)
         print("len of train labels: ", train_set.__len__())
@@ -557,6 +602,19 @@ class Trainer:
         recall = (tp / recall_den) if recall_den > 0 else 0.0
         f1 = (2 * precision * recall / (precision + recall)) if (precision + recall) > 0 else 0.0
 
-        self.group_comp(results, 'sensitive_info', 1)
+        # ---- Performance analysis: computed over ALL test rows ----
+        print("\n===== Performance analysis (all {} test rows) =====".format(len(y_true)))
+        print("F1: {:.4f} | Precision: {:.4f} | Recall: {:.4f}".format(f1, precision, recall))
+
+        # ---- Fairness analysis: only rows with a known sensitive attribute ----
+        known = results['sensitive_info'].isin([0, 1])
+        n_known = int(known.sum())
+        n_excluded = int((~known).sum())
+        print("\n===== Fairness analysis ({} rows; {} excluded for unknown race) =====".format(
+            n_known, n_excluded))
+        if n_known == 0:
+            print("No rows with a known sensitive attribute; skipping fairness analysis.")
+        else:
+            self.group_comp(results, 'sensitive_info', 1)
 
         return float(f1)

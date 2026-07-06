@@ -138,16 +138,22 @@ def main():
     set_seed(training['seed'])
 
     # Load data first so we can detect the input dimension automatically.
-    X, y = Trainer.load_data(
+    X, y, meta = Trainer.load_data(
         dataset['data_name'],
-        dataset['sensitive'],
         dataset['predict_attr'],
-        dataset['intertsted_columns'],
-        categorical_features=dataset.get('categorical_features'),
-        sensitive_mapping=dataset.get('sensitive_mapping'),
-        use_FeatureHasher=dataset.get('use_FeatureHasher', False),
+        numeric_columns=dataset.get('numeric_columns'),
+        categorical_columns=dataset.get('categorical_columns'),
+        multihot_columns=dataset.get('multihot_columns'),
+        hash_columns=dataset.get('hash_columns'),
+        hash_n_features=dataset.get('hash_n_features'),
+        sensitive_exclude_columns=dataset.get('sensitive_exclude_columns'),
+        sensitive_label_column=dataset.get('sensitive_label_column'),
+        race_list=dataset.get('race_list'),
+        privileged_race=dataset.get('privileged_race'),
+        multivalue_separator=dataset.get('multivalue_separator', ';'),
+        match_method=dataset.get('match_method', 'fuzzy'),
+        match_threshold=dataset.get('match_threshold', 0.6),
         query_str=dataset.get('query_str'),
-        n_features=dataset.get('n_features', 20),
     )
     print("Data shape:", X.shape, y.shape)
 
@@ -190,7 +196,8 @@ def main():
     valid_ratio = training['valid_ratio']
 
     train_set, valid_set, test_set, data_size = Trainer.load_train_test_valid(
-        X, y, 'all', train_ratio, valid_ratio, seed)
+        X, y, 'all', train_ratio, valid_ratio, seed,
+        numeric_columns=meta['numeric_columns'])
 
     # Stratification
     print("\nStarting stratification...")

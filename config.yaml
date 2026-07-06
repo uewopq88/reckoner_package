@@ -35,49 +35,63 @@ training:
 
 # -----------------------------------------------------------------------------
 # Dataset profiles
+#
+# Per-column processing is fully configurable:
+#   numeric_columns      -> StandardScaler (fit on the training split only)
+#   categorical_columns  -> one-hot encoding (single value per cell)
+#   multihot_columns     -> multi-hot encoding (multi-value, split on separator)
+#   hash_columns         -> FeatureHasher   (multi-value / high-cardinality)
+#
+# Sensitive attributes:
+#   sensitive_exclude_columns -> ALL removed from the features (train & test)
+#   sensitive_label_column    -> ONE column used to derive the fairness group
+#   race_list                 -> canonical list of race tags to match against
+#   privileged_race           -> which tag counts as privileged (rest = non-priv)
+#   match_method              -> exact | fuzzy | keyword | bert
+#   match_threshold           -> similarity cutoff for fuzzy/bert matching
+#   multivalue_separator      -> character separating multiple values in a cell
 # -----------------------------------------------------------------------------
 datasets:
 
-  # Recidivism prediction (whether an offender will re-offend) -- the main task.
+  # Recidivism prediction (whether an offender will re-offend).
   compas:
     data_name: compas-scores-two-years
-    sensitive: race
     predict_attr: is_recid
     query_str: "race in ('African-American','Caucasian')"
-    use_FeatureHasher: true
-    n_features: 20          # FeatureHasher output dimension
-    intertsted_columns:
+    numeric_columns:
       - juv_fel_count
       - juv_misd_count
       - juv_other_count
       - priors_count
       - age
+    categorical_columns:
       - c_charge_degree
-      - c_charge_desc
       - age_cat
       - sex
+    hash_columns:
+      - c_charge_desc          # high-cardinality (~410 values) -> FeatureHasher
+    hash_n_features:
+      c_charge_desc: 20
+    sensitive_exclude_columns:
       - race
-      - is_recid
-    categorical_features:
-      - c_charge_desc
-    sensitive_mapping:
-      race_African-American: 0
-      race_Caucasian: 1
+    sensitive_label_column: race
+    race_list:
+      - African-American
+      - Caucasian
+    privileged_race: Caucasian
+    match_method: exact        # COMPAS race values are already clean
 
   # Income prediction (kept for reference / comparison).
-  # NOTE: no sensitive_mapping is defined here, matching the original behaviour.
   new_adult:
     data_name: new_adult
-    sensitive: race
     predict_attr: income_label
-    use_FeatureHasher: true
-    n_features: 20
-    intertsted_columns:
+    numeric_columns:
       - hours-per-week
       - age
       - capital-gain
       - capital-loss
       - education-num
+    categorical_columns:
       - workclass
       - education
       - marital-status
@@ -85,14 +99,49 @@ datasets:
       - gender
       - native-country
       - occupation
+    sensitive_exclude_columns:
       - race
-      - income_label
-    categorical_features:
-      - workclass
-      - education
-      - marital-status
-      - relationship
-      - gender
-      - native-country
-      - occupation
-    sensitive_mapping: null
+    sensitive_label_column: race
+    race_list:
+      - White
+      - Black
+      - Asian-Pac-Islander
+      - Amer-Indian-Eskimo
+      - Other
+    privileged_race: White
+    match_method: exact
+
+  # QPS revictimisation prediction (the real task).
+  # NOTE: column lists / race_list / privileged_race are placeholders -- update
+  # them once the real data extract is available.
+  qps:
+    data_name: qps_revictimisation
+    predict_attr: Revictimised
+    query_str: null
+    numeric_columns:
+      - DeltaDays
+    categorical_columns:
+      - AgeBracket
+      - Gender
+      - District
+    multihot_columns:
+      - Class                  # multi-value, low cardinality -> multi-hot
+    hash_columns:
+      - IncidentTypes          # multi-value, high cardinality -> FeatureHasher
+    hash_n_features:
+      IncidentTypes: 20
+    sensitive_exclude_columns: # BOTH race columns removed from features
+      - Race
+      - SelfDefinedRace
+    sensitive_label_column: SelfDefinedRace   # used for the fairness group only
+    race_list:                 # TODO: replace with the real canonical race list
+      - Caucasian
+      - Aboriginal
+      - Torres Strait Islander
+      - Asian
+      - African
+      - Pacific Islander
+    privileged_race: Caucasian # TODO: confirm the privileged group
+    match_method: fuzzy        # fuzzy string matching (difflib); or 'bert'
+    match_threshold: 0.6
+    multivalue_separator: ";"
